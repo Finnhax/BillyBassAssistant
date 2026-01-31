@@ -1,0 +1,571 @@
+esphome:
+  name: bigmouthbilly
+  friendly_name: BigMouthBilly
+  on_boot:
+    priority: -10
+    then:
+      - binary_sensor.template.publish:
+          id: billy_motion_detected
+          state: OFF
+      - light.turn_on:
+          id: status_rgb
+          effect: "Rainbow"
+
+esp32:
+  board: esp32-s3-devkitc-1
+  cpu_frequency: 240MHz
+  variant: esp32s3
+  flash_size: 16MB
+  framework:
+    type: esp-idf
+    version: recommended
+    sdkconfig_options:
+      CONFIG_ESP32S3_DATA_CACHE_64KB: "y"
+      CONFIG_ESP32S3_DATA_CACHE_LINE_64B: "y"
+      CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB: "y"
+
+      # Moves instructions and read only data from flash into PSRAM on boot.
+      # Both enabled allows instructions to execute while a flash operation is in progress without needing to be placed in IRAM.
+      # Considerably speeds up mWW at the cost of using more PSRAM.
+      CONFIG_SPIRAM_RODATA: "y"
+      CONFIG_SPIRAM_FETCH_INSTRUCTIONS: "y"
+
+      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: "y"
+      CONFIG_BT_BLE_DYNAMIC_ENV_MEMORY: "y"
+
+      CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC: "y"
+      CONFIG_MBEDTLS_SSL_PROTO_TLS1_3: "y"  # TLS1.3 support isn't enabled by default in IDF 5.1.5
+
+psram:
+  mode: octal
+  speed: 80MHz
+  ignore_not_found: false
+
+# Enable logging
+logger:
+  level: DEBUG
+  logs:
+    sensor: ERROR
+    fan: ERROR
+    fan.hbridge: ERROR
+
+# Enable Home Assistant API
+api:
+  encryption:
+    key: ""
+
+ota:
+  - platform: esphome
+    password: ""
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: "Bigmouthbilly Fallback Hotspot"
+    password: ""
+
+captive_portal:
+
+globals:
+  - id: anim_head_up
+    type: bool
+    initial_value: 'false'
+  - id: anim_tail_up
+    type: bool
+    initial_value: 'false'
+
+# CONFIG
+number:
+  - platform: template
+    name: "LDR Activation Delta"
+    id: ldr_activation_delta
+    min_value: 0.01
+    max_value: 1.0
+    step: 0.01
+    initial_value: 0.1
+    unit_of_measurement: "V"
+    mode: box
+    entity_category: CONFIG
+    optimistic: True
+    restore_value: True
+
+  - platform: template
+    name: "LDR Activation Min"
+    id: ldr_activation_min
+    min_value: 0.0
+    max_value: 1.0
+    step: 0.01
+    initial_value: 0.1
+    unit_of_measurement: "V"
+    mode: box
+    entity_category: CONFIG
+    optimistic: True
+    restore_value: True
+
+  - platform: template
+    name: "LDR Timeout"
+    id: trigger_timeout
+    min_value: 0.1
+    max_value: 120.0
+    step: 0.1
+    initial_value: 5
+    unit_of_measurement: "s"
+    mode: box
+    entity_category: CONFIG
+    optimistic: True
+    restore_value: True
+
+  - platform: template
+    name: "Notice Chance"
+    id: notice_chance
+    min_value: 0
+    max_value: 100
+    step: 1
+    initial_value: 20
+    unit_of_measurement: "%"
+    mode: SLIDER
+    entity_category: CONFIG
+    optimistic: True
+    restore_value: True
+
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_rgb
+    chipset: WS2812
+    rgb_order: GRB
+    pin: GPIO48
+    num_leds: 1
+    name: "Status RGB"
+    restore_mode: RESTORE_AND_OFF
+    effects: 
+      - addressable_rainbow:
+          name: "Rainbow"
+
+binary_sensor:
+  #BUTTON
+  - platform: gpio
+    name: "Button"
+    id: billy_button
+    pin:
+      number: GPIO47
+      inverted: true
+      mode: INPUT_PULLUP
+    on_press: 
+      - if:
+          condition: voice_assistant.is_running
+          then:
+            - voice_assistant.stop:
+          else:
+            - voice_assistant.start:
+  
+  #MOTION
+  - platform: template
+    name: "Motion"
+    id: billy_motion_detected
+    device_class: motion
+    on_state_change: 
+      - if:
+          condition:
+            binary_sensor.is_on: billy_motion_detected
+          then:
+            script.execute: notice_me
+
+#LDR
+sensor:
+  - platform: adc
+    pin: GPIO1
+    id: billy_ldr
+    update_interval: 200ms
+    attenuation: 12db
+    filters:
+      - sliding_window_moving_average:
+          window_size: 5
+          send_every: 1
+    internal: True
+    on_value:
+      then:
+        - lambda: |-
+            static float last_stable_value = 0.0;
+            static uint32_t last_activation_time = 0;
+            uint32_t now = millis();
+            float current_value = x;
+            
+            // If active, reset after timer
+            if (id(billy_motion_detected).state) 
+            {
+              if (now - last_activation_time >= (uint32_t)(id(trigger_timeout).state * 1000.0)) 
+              {
+                id(billy_motion_detected).publish_state(false);
+                ESP_LOGD("main", "Motion reset");
+              }
+            }
+            else //Else handle activation
+            {
+              // Calc delta
+              float drop = last_stable_value - current_value;
+
+              if (drop > id(ldr_activation_delta).state && current_value > id(ldr_activation_min).state) 
+              {
+                if (!id(billy_motion_detected).state) 
+                {
+                  id(billy_motion_detected).publish_state(true);
+                  last_activation_time = millis();
+                  ESP_LOGD("main", "Motion detected!");
+                }
+              }
+
+              // Save last value
+              last_stable_value = current_value;
+            }
+
+#MOTORS
+output:
+  - platform: ledc
+    pin: GPIO39
+    id: motor_forward_pin
+    frequency: 20000 Hz
+  - platform: ledc
+    pin: GPIO40
+    id: motor_reverse_pin
+    frequency: 20000 Hz
+  - platform: ledc
+    frequency: 20000 Hz
+    pin: GPIO41
+    id: motor2_forward_pin
+  - platform: ledc
+    pin: GPIO42
+    frequency: 20000 Hz
+    id: motor2_reverse_pin
+
+fan:
+  - platform: hbridge
+    id: mouth_motor
+    name: "Billy Bass Mouth"
+    pin_a: motor2_reverse_pin
+    pin_b: motor2_forward_pin
+    decay_mode: SLOW
+    speed_count: 100
+    internal: True
+
+  - platform: hbridge
+    id: head_motor
+    name: "Billy Bass Head"
+    pin_a: motor_forward_pin
+    pin_b: motor_reverse_pin
+    decay_mode: SLOW
+    speed_count: 100
+    internal: True
+
+  - platform: hbridge
+    id: tail_motor
+    name: "Billy Bass Tail"
+    pin_a: motor_reverse_pin
+    pin_b: motor_forward_pin
+    decay_mode: SLOW
+    speed_count: 10
+    internal: True
+
+#SPEAKER/MIC
+i2s_audio:
+  - id: i2s_speaker
+    i2s_lrclk_pin: GPIO11   # LRC / WS
+    i2s_bclk_pin: GPIO10    # BCLK
+  - id: i2s_mic
+    i2s_bclk_pin: GPIO4   # SCK
+    i2s_lrclk_pin: GPIO5  # WS
+
+microphone:
+  - platform: i2s_audio
+    id: ext_mic
+    i2s_audio_id: i2s_mic
+    i2s_din_pin: GPIO6 # SD
+    adc_type: external
+    channel: left
+
+speaker:
+  # Hardware speaker
+  - platform: i2s_audio
+    id: ext_speaker
+    i2s_audio_id: i2s_speaker
+    dac_type: external
+    i2s_dout_pin: GPIO9
+    timeout: never
+    buffer_duration: 100ms
+    channel: mono
+
+  # Virtual speakers to combine announcement and media
+  - platform: mixer
+    id: mixing_speaker
+    output_speaker: ext_speaker
+    task_stack_in_psram: true
+    source_speakers: 
+      - id: announcement_mixing_input
+        timeout: never
+      - id: media_mixing_input
+        timeout: never
+
+  # Virtual speakers to resample audio if necessary
+  - platform: resampler
+    id: announcement_resampling_speaker
+    output_speaker: announcement_mixing_input
+  - platform: resampler
+    id: media_resampling_speaker
+    output_speaker: media_mixing_input
+
+media_player:
+  - platform: speaker
+    name: None
+    id: billy_media_player
+    announcement_pipeline:
+      speaker: announcement_resampling_speaker
+      format: WAV
+      sample_rate: 22050
+    media_pipeline: 
+      speaker: media_resampling_speaker
+      format: WAV
+      sample_rate: 22050
+    buffer_size: 6000
+    volume_min: 0.4
+    files: 
+      - id: timer_finished_sound
+        file: audio/timer_finished_alarm.flac
+
+micro_wake_word:
+  id: mww
+  microphone: 
+    microphone: ext_mic
+    gain_factor: 4
+  stop_after_detection: false
+  vad:
+  models:
+    - model: https://github.com/Finnhax/BillyBassAssistant/releases/download/hey_billy/hey_billy.json
+      id: hey_billy
+    - model: https://github.com/kahrendt/microWakeWord/releases/download/stop/stop.json
+      id: stop
+      internal: true
+  on_wake_word_detected:
+    - if: #stop voice assistant if running
+        condition:
+          voice_assistant.is_running:
+        then:
+          voice_assistant.stop:
+        #stop other media player announcement
+        else:
+          - if:
+              condition:
+                media_player.is_announcing:
+              then:
+                - media_player.stop:
+                    announcement: true
+              # start voice assistant
+              else:
+                - voice_assistant.start:
+                    wake_word: !lambda return wake_word;
+
+voice_assistant:
+  id: billy_va
+  media_player: billy_media_player
+  microphone: ext_mic
+  use_wake_word: False
+  micro_wake_word: mww
+  auto_gain: 0dBFS
+  volume_multiplier: 1
+  noise_suppression_level: 0
+  on_client_connected: 
+    - micro_wake_word.start:
+    - light.turn_off: status_rgb
+  on_client_disconnected: 
+    - voice_assistant.stop:  
+  on_start:
+    - script.execute: duck_media
+    - script.execute: head_up
+  on_listening: 
+    - script.execute: mouth_stop
+  on_tts_end: # finished processing tts, starting playback
+    - script.execute: duck_media
+    - if:
+        condition:
+          lambda: 'return id(anim_head_up) == true;'
+        then:
+          - script.execute: head_down
+        else:
+          - script.execute: head_up
+    - delay: 500ms
+    - script.execute: mouth_move
+  on_end:
+    - wait_until:
+        not:
+          voice_assistant.is_running:
+    - script.execute: unduck_media
+    - script.execute: head_down
+    - script.execute: mouth_stop
+  on_error: 
+    - script.execute: head_down
+    - script.execute: unduck_media
+    - script.execute: mouth_stop
+      
+script:
+  # ANIMATIONS
+  - id: head_up
+    mode: single
+    then:
+      - if:
+          condition: # only if head isn't up already
+            lambda: 'return id(anim_head_up) == false;'
+          then:
+            - wait_until:
+                lambda: 'return id(anim_tail_up) == false;'
+            - globals.set: 
+                id: anim_head_up
+                value: 'true'
+            - fan.turn_off: tail_motor
+            - fan.turn_on:
+                id: head_motor
+                speed: 100
+            - delay: 1200ms 
+            - fan.turn_on:
+                id: head_motor
+                speed: 60
+
+  - id: head_down
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(anim_head_up) == true;'
+          then:
+            - fan.turn_off: head_motor
+            - delay: 400ms
+            - fan.turn_on: 
+                id: tail_motor
+                speed: 100
+            - delay: 50ms
+            - fan.turn_off: tail_motor
+            - globals.set: 
+                id: anim_head_up
+                value: 'false'
+
+  - id: tail_wiggle
+    mode: single
+    then:
+      - if:
+          condition:
+            lambda: 'return id(anim_head_up) == false;'
+          then:
+            - globals.set:
+                id: anim_tail_up
+                value: 'true'
+            - fan.turn_off: head_motor
+            - fan.turn_on:
+                id: tail_motor
+                speed: 100
+            - delay: 400ms 
+            - fan.turn_off:
+                id: tail_motor
+            - delay: 300ms
+            - fan.turn_on:
+                id: head_motor
+                speed: 100
+            - delay: 50ms
+            - fan.turn_off: head_motor
+            - globals.set:
+                id: anim_tail_up
+                value: 'false'
+
+  - id: mouth_move
+    mode: single
+    then:
+      - logger.log: "Moving mouth"
+      - while:
+          condition:
+            voice_assistant.is_running:
+          then:
+            - fan.turn_on:
+                id: mouth_motor
+                speed: !lambda "return 70 + (rand() % 30);"
+            - delay: !lambda "return 80 + (rand() % 170);"
+            - fan.turn_off: mouth_motor
+            - delay: !lambda "return 50 + (rand() % 100);"
+      - logger.log: "Auto-Stopping mouth"
+      - fan.turn_off: mouth_motor
+
+  - id: mouth_stop
+    mode: single
+    then:
+      - logger.log: "Stopping mouth"
+      - script.stop: mouth_move
+      - fan.turn_off: mouth_motor
+
+  - id: notice_me
+    mode: single
+    then:
+      - if:
+          condition:
+            and:
+              - lambda: !lambda "return (rand() % 100) <=  id(notice_chance).state;"
+              - media_player.is_idle
+          then:
+            - logger.log: "Motion script triggered"
+            - if: 
+                condition: # 50% chance
+                  - lambda: !lambda "return (rand() % 100) >= 50;" 
+                then: # lift head
+                  - script.execute: head_up
+                  - delay: 2000ms
+                  - script.execute: head_down
+                else: # wiggle tail
+                  - script.execute: tail_wiggle
+  
+  # VOICE ASSISTANT
+  - id: activate_stop_word_once
+    then:
+      - delay: 1s
+      # Enable stop wake word
+      - micro_wake_word.enable_model: stop
+      - wait_until:
+          not:
+            media_player.is_announcing:
+      - micro_wake_word.disable_model: stop
+
+  # AUDIO
+  - id: duck_media
+    mode: single
+    then:
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 20
+          duration: 0.0s
+
+  - id: unduck_media
+    mode: single
+    then:
+      - mixer_speaker.apply_ducking:
+          id: media_mixing_input
+          decibel_reduction: 0
+          duration: 500ms
+
+# DEBUG-BUTTONS
+button:
+  - platform: template
+    name: "Test: Mund"
+    on_press:
+      - fan.turn_on:
+          id: mouth_motor
+          speed: 100
+      - delay: 200ms
+      - fan.turn_off: mouth_motor
+
+  - platform: template
+    name: "Test: Kopf heben"
+    on_press:
+      - script.execute: head_up
+      - delay: 3000ms
+      - script.execute: head_down
+
+  - platform: template
+    name: "Test: Schwanz wackeln"
+    on_press:
+      - script.execute: tail_wiggle
